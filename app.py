@@ -4,7 +4,7 @@ import os
 import zipfile
 
 import streamlit as st
-from openai import OpenAI, to_file
+from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(page_title='AI 포스터 디자인 스튜디오', page_icon='🎨', layout='wide')
@@ -90,7 +90,9 @@ def compose(background, meta):
 
 
 def image_file(data, name='poster.png'):
-    return to_file(io.BytesIO(data), filename=name, content_type='image/png')
+    file = io.BytesIO(data)
+    file.name = name
+    return file
 
 
 def upload_files(files):
