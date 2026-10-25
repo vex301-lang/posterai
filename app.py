@@ -1,224 +1,359 @@
-import base64
+"""AI 포스터 디자인 스튜디오 PRO (Streamlit Community Cloud)."""
+from __future__ import annotations
+
+import copy
 import io
+import json
 import os
 import zipfile
+from datetime import datetime
 
 import streamlit as st
-from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
 
-st.set_page_config(page_title='AI 포스터 디자인 스튜디오', page_icon='🎨', layout='wide')
-st.title('🎨 AI 포스터 디자인 스튜디오')
-st.caption('3가지 시안을 만들고, 마음에 드는 시안을 자연어로 수정하세요.')
+from poster_engine import (
+    PALETTES,
+    SIZES,
+    STYLE_LABELS,
+    default_spec,
+    high_res_png,
+    offline_background_bytes,
+    render_poster,
+)
+from ai_services import (
+    IMAGE_MODELS,
+    ai_instruction,
+    analyze_reference_style,
+    generate_art,
+    local_instruction,
+)
 
-with st.sidebar:
-    st.header('1. 행사 정보')
-    title = st.text_input('행사 제목 *', placeholder='2026 꿈나눔예술제')
-    subtitle = st.text_input('부제 / 슬로건')
-    date = st.text_input('날짜 및 시간')
-    place = st.text_input('장소')
-    details = st.text_area('추가 안내')
-    mood = st.selectbox('분위기', ['밝고 경쾌한', '고급스럽고 세련된', '따뜻하고 감성적인', '미니멀한', '역동적이고 강렬한', '동화 같은', '직접 입력'])
-    custom_mood = st.text_input('원하는 분위기') if mood == '직접 입력' else ''
-    size = st.selectbox('포스터 크기', ['A3 세로 (297×420mm)', 'A4 세로 (210×297mm)', '정사각형 (1:1)', '가로형 (3:2)', '세로 SNS (4:5)', '스토리 (9:16)'])
-    st.header('2. 사진 업로드')
-    refs = st.file_uploader('레퍼런스 이미지', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
-    photos = st.file_uploader('포스터에 사용할 사진', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
-    st.header('3. API')
+st.set_page_config(
+    page_title="POSTER LAB · AI 포스터 디자인 스튜디오",
+    page_icon="🎨",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """<style>
+      .block-container {padding-top: 2rem; max-width: 1500px;}
+      h1 {font-size: 2.0rem !important; letter-spacing: -.05em;}
+      h2,h3 {letter-spacing: -.035em;}
+      [data-testid="stSidebar"] {background: #f6f4f1;}
+      [data-testid="stSidebar"] h3 {margin-top: 1.5rem;}
+      .info-hint {color:#6a655f;font-size:.92rem;line-height:1.55;}
+      .poster-caption {text-align:center;color:#68625e;font-size:.9rem;margin-top:.25rem;}
+      div.stButton > button[kind="primary"] {background:#c25230; border-color:#c25230;}
+      [data-testid="stImage"] img {border-radius: 3px; box-shadow: 0 10px 26px rgba(32,20,10,.12);}
+    </style>""",
+    unsafe_allow_html=True,
+)
+
+
+def streamlit_key() -> str:
     try:
-        default_key = st.secrets.get('OPENAI_API_KEY', '')
+        return str(st.secrets.get("OPENAI_API_KEY", "") or "").strip()
     except Exception:
-        default_key = os.getenv('OPENAI_API_KEY', '')
-    api_key = st.text_input('OpenAI API 키', value=default_key, type='password')
-    model = st.selectbox('이미지 모델', ['gpt-image-1.5', 'gpt-image-1'], index=0)
-    quality = st.selectbox('이미지 품질', ['medium', 'high', 'low'], index=0)
-    st.caption('시안 생성과 자연어 수정은 각각 API 요금이 발생합니다.')
+        return str(os.getenv("OPENAI_API_KEY", "") or "").strip()
 
 
-def output_size(value):
-    if '정사각형' in value:
-        return '1024x1024'
-    if '가로형' in value:
-        return '1536x1024'
-    return '1024x1536'
+def bytes_of_files(uploaded, limit: int = 6) -> list[bytes]:
+    if not uploaded:
+        return []
+    results = []
+    for item in uploaded[:limit]:
+        data = item.getvalue()
+        if len(data) > 18 * 1024 * 1024:
+            st.warning(f"{item.name}: 18MB가 넘는 이미지는 제외했습니다.")
+        else:
+            results.append(data)
+    return results
 
 
-def font_path():
-    for path in ['/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', '/usr/share/fonts/truetype/nanum/NanumGothic.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf']:
-        if os.path.exists(path):
-            return path
-    return None
+def merged_meta(meta: dict[str,str], draft: dict) -> dict[str,str]:
+    return {**meta, **draft.get("content_overrides", {})}
 
 
-def wrap_text(draw, text, font, max_width):
-    lines = []
-    for paragraph in text.splitlines():
-        current = ''
-        for ch in paragraph:
-            if current and draw.textbbox((0, 0), current + ch, font=font)[2] > max_width:
-                lines.append(current)
-                current = ch
-            else:
-                current += ch
-        if current:
-            lines.append(current)
-    return lines
+def output_png(draft: dict, meta: dict[str,str], photos: list[bytes], size_name: str) -> bytes:
+    return render_poster(draft.get("art"), merged_meta(meta,draft), photos, draft["spec"], size_name)
 
 
-def compose(background, meta):
-    image = Image.open(io.BytesIO(background)).convert('RGBA')
-    w, h = image.size
-    overlay = Image.new('RGBA', (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    draw.rectangle((0, int(h * .65), w, h), fill=(7, 15, 30, 224))
-    path = font_path()
-    def font(size):
-        return ImageFont.truetype(path, size) if path else ImageFont.load_default()
-    fields = [('title', .68, .063, 2), ('subtitle', .79, .030, 1), ('date', .85, .028, 1), ('place', .90, .028, 1), ('details', .95, .021, 1)]
-    for key, y, scale, limit in fields:
-        value = meta.get(key, '').strip()
-        if not value:
-            continue
-        f = font(max(16, int(w * scale)))
-        for line in wrap_text(draw, value, f, int(w * .87))[:limit]:
-            draw.text((int(w * .065), int(h * y)), line, font=f, fill='white')
-            y += f.size * 1.12 / h if hasattr(f, 'size') else .02
-    result = Image.alpha_composite(image, overlay).convert('RGB')
-    buffer = io.BytesIO()
-    result.save(buffer, format='PNG')
-    return buffer.getvalue()
+def show_error(error: Exception) -> str:
+    # Never show credentials or request payloads in the client UI.
+    code=getattr(error,"status_code",None)
+    message=str(error)
+    if code == 401:
+        return "API 키가 유효하지 않습니다. Streamlit Secrets의 OPENAI_API_KEY를 확인해 주세요."
+    if code == 429:
+        return "API 사용 한도 또는 결제 잔액 문제입니다. OpenAI Platform의 Billing과 Limits를 확인해 주세요."
+    if code == 403:
+        return "선택한 이미지 모델의 사용 권한이 없습니다. 계정 인증 또는 모델 접근 권한을 확인해 주세요."
+    return (type(error).__name__+": "+message)[:380]
 
 
-def image_file(data, name='poster.png'):
-    file = io.BytesIO(data)
-    file.name = name
-    return file
+def generate_three(api_key: str, use_ai: bool, metadata: dict[str,str], mood: str, palette: str,
+                   size_name: str, model: str, quality: str, refs: list[bytes], ref_mode: str) -> tuple[list[dict], list[str]]:
+    drafts=[]
+    warnings=[]
+    style_brief=""
+    if use_ai and refs and ref_mode == "스타일만 분석 (추천)":
+        try:
+            with st.spinner("레퍼런스 이미지의 분위기와 색감을 먼저 분석합니다."):
+                style_brief=analyze_reference_style(api_key,refs)
+        except Exception as exc:
+            warnings.append("스타일 분석 실패. 참고 이미지를 직접 전달하여 진행합니다: "+show_error(exc))
+    progress=st.progress(0,text="서로 다른 아트 디렉션을 준비하고 있습니다.")
+    for i in range(3):
+        spec=default_spec(i,palette)
+        source="AI 배경" if use_ai else "로컬 미리보기"
+        if use_ai:
+            try:
+                send_refs=refs if (ref_mode != "스타일만 분석 (추천)" or (refs and not style_brief)) else []
+                art=generate_art(api_key,metadata,mood,i,palette,size_name,model,quality,send_refs,reference_style=style_brief)
+            except Exception as exc:
+                # Clearly mark any fallback instead of implying successful AI generation.
+                art=offline_background_bytes(size_name,palette,i)
+                source="API 실패 · 로컬 대체"
+                warnings.append(f"{i+1}안: {show_error(exc)}")
+        else:
+            art=offline_background_bytes(size_name,palette,i)
+        drafts.append({"art":art,"spec":spec,"source":source,"history":[],"content_overrides":{},"edit_log":[]})
+        progress.progress((i+1)/3,text=f"{i+1}/3 시안을 준비했습니다.")
+    progress.empty()
+    return drafts,warnings
 
 
-def upload_files(files):
-    result = []
-    for index, file in enumerate(files[:10]):
-        image = Image.open(io.BytesIO(file.getvalue())).convert('RGB')
-        image.thumbnail((1800, 1800))
-        buf = io.BytesIO()
-        image.save(buf, format='PNG')
-        result.append(image_file(buf.getvalue(), f'input_{index}.png'))
-    return result
+if "drafts" not in st.session_state:
+    st.session_state["drafts"] = []
+if "selected" not in st.session_state:
+    st.session_state["selected"] = 0
+if "project_size" not in st.session_state:
+    st.session_state["project_size"] = "A3 세로 · 297×420mm"
 
-
-def generated_bytes(response):
-    return base64.b64decode(response.data[0].b64_json)
-
-
-if 'designs' not in st.session_state:
-    st.session_state.designs = []
-if 'revision_log' not in st.session_state:
-    st.session_state.revision_log = []
-
-meta = dict(title=title, subtitle=subtitle, date=date, place=place, details=details)
-
-if st.button('✨ 서로 다른 포스터 3개 생성', type='primary', use_container_width=True):
-    if not title.strip():
-        st.error('행사 제목을 입력하세요.')
-    elif not api_key:
-        st.error('API 키를 입력하세요.')
+# A sidebar acts as a true editable brief. Exact text is never generated by the image model.
+with st.sidebar:
+    st.markdown("## 01 / 행사 정보")
+    event_title=st.text_input("행사 제목 *",value="2026 꿈나눔예술제",max_chars=120)
+    event_subtitle=st.text_input("부제 / 슬로건",value="우리의 상상이 예술이 되는 날",max_chars=150)
+    event_when=st.text_area("날짜와 시간",value="",placeholder="예: 2026. 11. 10.(화) 14:00",height=78,max_chars=300)
+    event_where=st.text_input("장소",value="한신초등학교",max_chars=180)
+    event_details=st.text_area("추가 안내",value="작품 전시회 · 예술 발표회",height=84,max_chars=400)
+    event_organizer=st.text_input("주최 / 주관 (상단 작은 글씨)",value="HANSIN SCHOOL ARTS FESTIVAL",max_chars=110)
+    st.markdown("## 02 / 아트 디렉션")
+    mood=st.text_area("원하는 분위기",value="따뜻한 가을 축제, 질감 있는 수채화와 고급스러운 편집 디자인, 생동감 있는 어린이 예술 활동",height=102)
+    palette_labels={
+        "가을 · 테라코타":"autumn","파스텔 · 라벤더":"pastel","청량 · 블루":"ocean",
+        "자연 · 포레스트":"forest","밤 · 네이비":"night","햇살 · 비비드":"sunshine","미니멀 · 모노":"mono",
+    }
+    palette_label=st.selectbox("컬러 팔레트",list(palette_labels),index=0)
+    palette=palette_labels[palette_label]
+    size_name=st.selectbox("포스터 크기",list(SIZES),key="project_size")
+    st.markdown("## 03 / 이미지 업로드")
+    refs_upload=st.file_uploader("스타일 참고 이미지 (최대 3개)",type=["jpg","jpeg","png","webp"],accept_multiple_files=True,key="style_refs",help="AI 생성 시 스타일 참고용으로 전달됩니다. 참고 포스터의 문구나 로고는 복제하지 않습니다.")
+    ref_mode=st.selectbox("레퍼런스 해석 방식",["스타일만 분석 (추천)","이미지 직접 참고"],help="스타일 분석: AI가 참고 포스터의 글자를 따라 그리는 문제를 줄입니다. 직접 참고: 원본 그림과 더 유사해지지만 가짜 글자가 생길 수 있습니다.")
+    photos_upload=st.file_uploader("실제 사용할 사진 (최대 4개)",type=["jpg","jpeg","png","webp"],accept_multiple_files=True,key="poster_photos",help="이 사진들은 OpenAI에 보내지 않고 앱 서버에서 원본 픽셀을 보존해 포스터에 합성합니다.")
+    if refs_upload and len(refs_upload)>3:
+        st.info("참고 이미지는 앞의 3개만 사용합니다.")
+    if photos_upload and len(photos_upload)>4:
+        st.info("실제 사진은 앞의 4개만 사용합니다.")
+    st.markdown("## 04 / 이미지 생성 API")
+    secret=streamlit_key()
+    if secret:
+        st.success("Streamlit Secrets의 OpenAI API 키를 사용합니다.")
+        api_key=secret
     else:
-        client = OpenAI(api_key=api_key)
-        styles = [
-            'Minimal editorial design, sophisticated negative space and strong hierarchy.',
-            'Bold colorful festival graphics, lively geometric shapes and dynamic energy.',
-            'Warm artistic collage, tactile paper textures and expressive imagery.'
-        ]
-        new_designs = []
-        for index, style in enumerate(styles):
-            with st.spinner(f'{index + 1}/3 시안 생성 중...'):
-                prompt = (f'Create a polished professional event poster BACKGROUND ARTWORK, with no text of any kind. '
-                          f'Style: {style}. Mood: {custom_mood or mood}. Event theme: {title}. '
-                          f'Use reference images for inspiration, and incorporate supplied event photos naturally when possible. '
-                          f'Do not alter identities of people in photos. Reserve the bottom 35% as a calm, uncluttered area '
-                          f'for a separate Korean text overlay. Aspect ratio: {size}. '
-                          f'No words, letters, digits, logos, watermarks, signs or fake typography.')
-                try:
-                    images = upload_files(list(refs or []) + list(photos or []))
-                    if images:
-                        response = client.images.edit(model=model, image=images, prompt=prompt, size=output_size(size), quality=quality)
-                    else:
-                        response = client.images.generate(model=model, prompt=prompt, size=output_size(size), quality=quality)
-                    background = generated_bytes(response)
-                    new_designs.append({'background': background, 'history': [background]})
-                except Exception as exc:
-                    st.error(f'{index + 1}번 생성 실패: {exc}')
-                    break
-        if new_designs:
-            st.session_state.designs = new_designs
-            st.session_state.revision_log = []
-            st.success(f'{len(new_designs)}개 시안을 생성했습니다.')
+        api_key=st.text_input("OpenAI API 키 (임시 입력)",type="password",help="공유할 앱이면 Streamlit Cloud → Settings → Secrets에 OPENAI_API_KEY를 등록하세요.").strip()
+    model_label=st.selectbox("이미지 모델",list(IMAGE_MODELS),index=0)
+    selected_model=IMAGE_MODELS[model_label]
+    available_qualities=["high","xhigh","max","medium","low"] if "2.5" in selected_model else ["high","medium","low"]
+    selected_quality=st.selectbox("이미지 품질",available_qualities,index=0)
+    st.caption("3안 생성 시 이미지 API를 최대 3회 호출하므로 3회분 요금이 부과될 수 있습니다. AI 실패 시 로컬 배경으로 대체하고 실패 사실을 표시합니다.")
 
-if st.session_state.designs:
-    st.subheader('생성된 시안')
-    columns = st.columns(len(st.session_state.designs))
-    for index, design in enumerate(st.session_state.designs):
-        with columns[index]:
-            poster = compose(design['background'], meta)
-            st.image(poster, caption=f'시안 {index + 1} · 수정 {len(design["history"]) - 1}회', use_container_width=True)
-            st.download_button('PNG 저장', poster, file_name=f'poster_{index + 1}.png', mime='image/png', key=f'png_{index}')
+meta={"title":event_title.strip(),"subtitle":event_subtitle.strip(),"when":event_when.strip(),"where":event_where.strip(),"details":event_details.strip(),"organizer":event_organizer.strip()}
+refs=bytes_of_files(refs_upload,limit=3)
+photos=bytes_of_files(photos_upload,limit=4)
 
+st.markdown("# POSTER LAB <span style='font-size:.52em;color:#bb5b35;font-weight:600'>PRO</span>",unsafe_allow_html=True)
+st.markdown("**예술적인 배경은 AI로, 한글과 실제 사진은 정확한 레이어로.** 서로 다른 세 가지 디자인을 만들고 한국어로 수정하세요.")
+
+left,right=st.columns([.70,.30],gap="large")
+with left:
+    st.markdown("<div class='info-hint'>정보 입력 → 레퍼런스 추가 → 3개 시안 생성 → 자연어 수정 → PNG 저장</div>",unsafe_allow_html=True)
+with right:
+    if api_key:
+        st.caption("● AI 이미지 생성 준비됨")
+    else:
+        st.caption("● API 키 없이도 디자인 미리보기 가능")
+
+btn1,btn2,_=st.columns([1.15,1,2],gap="small")
+with btn1:
+    generate_clicked=st.button("✦ AI 포스터 3안 생성",type="primary",use_container_width=True,disabled=not bool(api_key))
+with btn2:
+    demo_clicked=st.button("무료 로컬 미리보기 3안",use_container_width=True)
+
+if generate_clicked or demo_clicked:
+    if not event_title.strip():
+        st.error("행사 제목을 입력해 주세요.")
+    else:
+        with st.spinner("스타일별 포스터 배경과 편집 레이아웃을 구성하고 있습니다."):
+            new_drafts,notes=generate_three(api_key,generate_clicked,meta,mood,palette,size_name,selected_model,selected_quality,refs,ref_mode)
+        st.session_state.drafts=new_drafts
+        st.session_state.selected=0
+        st.session_state.generation_notes=notes
+        st.rerun()
+
+if st.session_state.get("generation_notes"):
+    for note in st.session_state["generation_notes"]:
+        st.warning(note)
+
+if not st.session_state.drafts:
     st.divider()
-    st.subheader('💬 자연어로 포스터 수정')
-    st.caption('예: 배경을 파스텔톤으로 바꿔줘 / 인물 사진을 더 크게 보여줘 / 왼쪽에 꽃 장식을 추가해줘')
-    selection = st.selectbox('수정할 시안 선택', range(len(st.session_state.designs)), format_func=lambda i: f'시안 {i + 1}')
-    instruction = st.text_area('수정 명령', placeholder='예: 전체 분위기를 더 따뜻하게 만들고 배경에 작은 별을 추가해줘.', height=110)
-    st.info('행사 제목·시간·장소는 정확한 한글 표시를 위해 별도로 합성됩니다. 해당 문구는 왼쪽 행사 정보에서 수정하세요.')
-    left, right = st.columns(2)
-    with left:
-        revise = st.button('🎨 선택한 시안 수정하기', type='primary', use_container_width=True)
-    with right:
-        undo = st.button('↩ 이전 디자인으로 되돌리기', use_container_width=True)
+    st.info("처음이라면 **무료 로컬 미리보기 3안**으로 레이아웃을 확인하세요. 이후 API 키를 등록하고 AI 시안을 생성할 수 있습니다.")
+    st.markdown("#### 기존 포스터와 달라진 점")
+    st.markdown("한글은 **글꼴과 배치 엔진으로 직접 렌더링**해 글자 깨짐을 줄입니다. 레퍼런스 이미지는 **분위기**만 AI에 전달하고, 실제 사진은 **원본 그대로** 카드·프레임에 배치합니다. 배경만 재생성할 수도 있습니다.")
+    st.stop()
 
-    if revise:
-        if not instruction.strip():
-            st.warning('수정할 내용을 입력하세요.')
-        elif not api_key:
-            st.error('API 키를 입력하세요.')
+st.divider()
+st.subheader("01 · 제안 시안 3종")
+preview_cols=st.columns(3,gap="medium")
+for idx,draft in enumerate(st.session_state.drafts):
+    with preview_cols[idx]:
+        try:
+            png=output_png(draft,meta,photos,size_name)
+        except Exception as exc:
+            st.error(f"{idx+1}안 렌더링 오류: {show_error(exc)}")
+            continue
+        st.image(png,use_container_width=True)
+        st.markdown(f"**{STYLE_LABELS.get(draft['spec'].get('layout'),'포스터 시안')}**")
+        st.caption(draft.get("source",""))
+        dlcol,selcol=st.columns([.52,.48],gap="small")
+        with dlcol:
+            st.download_button("PNG 저장",data=png,file_name=f"poster_option_{idx+1}.png",mime="image/png",use_container_width=True,key=f"download_{idx}")
+        with selcol:
+            if st.button("수정 선택",use_container_width=True,key=f"select_{idx}"):
+                st.session_state.selected=idx
+                st.rerun()
+
+selected_idx=min(int(st.session_state.selected),len(st.session_state.drafts)-1)
+draft=st.session_state.drafts[selected_idx]
+st.divider()
+st.subheader(f"02 · 선택한 시안 수정  /  {selected_idx+1}안")
+edit_col,detail_col=st.columns([1.15,1],gap="large")
+
+with edit_col:
+    st.markdown("**자연어 수정**")
+    edit_instruction=st.text_area("원하는 변경 내용을 자유롭게 적어주세요",value="",height=115,placeholder="예) 제목을 더 크게, 배경은 파스텔 핑크로, 사진을 조금 더 작게 만들어줘.",key="edit_instruction")
+    repaint=st.checkbox("AI 배경 그림도 새로 생성하기 (이미지 API 추가 비용 발생)",value=False)
+    use_language_model=st.checkbox("AI가 자연어 지시를 분석하기 (소액의 텍스트 API 비용)",value=bool(api_key),disabled=not bool(api_key))
+    fix_col,undo_col=st.columns([.67,.33])
+    with fix_col:
+        apply_clicked=st.button("수정 적용",type="primary",use_container_width=True)
+    with undo_col:
+        undo_clicked=st.button("↶ 이전으로",use_container_width=True,disabled=not bool(draft.get("history")))
+
+    if undo_clicked:
+        st.session_state.pop("zip_result",None)
+        st.session_state.pop("print_png",None)
+        snapshot=draft["history"].pop()
+        draft["spec"]=snapshot["spec"]
+        draft["art"]=snapshot["art"]
+        draft["content_overrides"]=snapshot["content_overrides"]
+        draft["edit_log"].append("직전 수정 취소")
+        st.rerun()
+
+    if apply_clicked:
+        if not edit_instruction.strip():
+            st.warning("수정 명령을 먼저 입력해 주세요.")
         else:
-            with st.spinner('선택한 포스터를 수정하고 있습니다...'):
-                try:
-                    design = st.session_state.designs[selection]
-                    prompt = (f'Edit the provided poster background artwork according to this Korean user instruction: '
-                              f'{instruction.strip()}\n'
-                              f'Keep the overall composition, subject identities and recognizable photographs unless the '
-                              f'instruction explicitly requests a change. Preserve the bottom 35% as a visually quiet area '
-                              f'for separately composited Korean event information. '
-                              f'IMPORTANT: Do not add any text, letters, numbers, pseudo-text or watermarks. '
-                              f'Output the revised poster background artwork only, maintaining the same aspect ratio.')
-                    client = OpenAI(api_key=api_key)
-                    response = client.images.edit(model=model, image=[image_file(design['background'])], prompt=prompt,
-                                                  size=output_size(size), quality=quality)
-                    updated = generated_bytes(response)
-                    design['background'] = updated
-                    design['history'].append(updated)
-                    st.session_state.revision_log.append((selection + 1, instruction.strip()))
-                    st.success('수정했습니다. 위 시안과 다운로드 파일에 반영되었습니다.')
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f'수정 실패: {exc}')
-    if undo:
-        design = st.session_state.designs[selection]
-        if len(design['history']) <= 1:
-            st.warning('되돌릴 이전 디자인이 없습니다.')
-        else:
-            design['history'].pop()
-            design['background'] = design['history'][-1]
+            prior={"spec":copy.deepcopy(draft["spec"]),"art":draft.get("art"),"content_overrides":copy.deepcopy(draft.get("content_overrides",{}))}
+            try:
+                if use_language_model and api_key:
+                    try:
+                        update=ai_instruction(api_key,edit_instruction,draft["spec"],merged_meta(meta,draft))
+                    except Exception as exc:
+                        st.warning("AI 명령 해석이 어려워 기본 규칙으로 적용했습니다: "+show_error(exc))
+                        update=local_instruction(edit_instruction,draft["spec"])
+                else:
+                    update=local_instruction(edit_instruction,draft["spec"])
+                next_spec={**draft["spec"],**update.get("spec",{})}
+                new_art=draft.get("art")
+                if repaint:
+                    if not api_key:
+                        st.warning("API 키가 없어서 배경 재생성은 생략하고 레이아웃만 수정합니다.")
+                    else:
+                        try:
+                            next_meta={**merged_meta(meta,draft),**update.get("content_updates",{})}
+                            with st.spinner("AI가 배경 아트워크를 다시 작업하고 있습니다."):
+                                new_art=generate_art(api_key,next_meta,mood,selected_idx,next_spec.get("palette",palette),size_name,selected_model,selected_quality,refs,base_art=draft.get("art"),extra=next_spec.get("background_note") or edit_instruction)
+                        except Exception as exc:
+                            st.warning("배경 재생성 실패 — 기존 배경을 유지합니다: "+show_error(exc))
+                st.session_state.pop("zip_result",None)
+                st.session_state.pop("print_png",None)
+                draft["history"].append(prior)
+                draft["history"]=draft["history"][-8:]
+                draft["spec"]=next_spec
+                draft["art"]=new_art
+                draft["content_overrides"]={**draft.get("content_overrides",{}),**update.get("content_updates",{})}
+                draft["edit_log"].append(edit_instruction.strip()[:180])
+                st.session_state["last_edit_summary"]=update.get("summary", "디자인을 수정했습니다.")
+                st.rerun()
+            except Exception as exc:
+                st.error("수정에 실패하여 이전 포스터를 유지합니다: "+show_error(exc))
+    if st.session_state.get("last_edit_summary"):
+        st.success(st.session_state.last_edit_summary)
+    with st.expander("선택 시안의 상세 디자인 설정"):
+        option=draft["spec"]
+        key_base=f"spec_{selected_idx}"
+        new_palette=st.selectbox("색상",list(PALETTES),index=list(PALETTES).index(option.get("palette","autumn")),key=f"{key_base}_palette")
+        new_layout=st.selectbox("레이아웃",list(STYLE_LABELS),index=list(STYLE_LABELS).index(option.get("layout","editorial")),format_func=lambda x:STYLE_LABELS[x],key=f"{key_base}_layout")
+        new_ts=st.slider("제목 크기",0.70,1.4,float(option.get("title_scale",1)),0.05,key=f"{key_base}_ts")
+        new_ps=st.slider("사진 크기",0.65,1.3,float(option.get("photo_scale",1)),0.05,key=f"{key_base}_ps")
+        new_align=st.selectbox("제목 정렬",["left","center"],index=0 if option.get("alignment","left")=="left" else 1,format_func=lambda v:"왼쪽" if v=="left" else "가운데",key=f"{key_base}_align")
+        if st.button("세부 설정 적용",key=f"{key_base}_save"):
+            st.session_state.pop("zip_result",None)
+            st.session_state.pop("print_png",None)
+            draft["history"].append({"spec":copy.deepcopy(option),"art":draft.get("art"),"content_overrides":copy.deepcopy(draft.get("content_overrides",{}))})
+            option.update({"palette":new_palette,"layout":new_layout,"title_scale":new_ts,"photo_scale":new_ps,"alignment":new_align})
             st.rerun()
+    if draft.get("content_overrides"):
+        with st.expander("자연어로 변경한 행사 문구 확인 / 초기화"):
+            st.json(draft["content_overrides"],expanded=False)
+            if st.button("문구 변경만 취소",key="clear_text_overrides"):
+                st.session_state.pop("zip_result",None)
+                st.session_state.pop("print_png",None)
+                draft["content_overrides"]={}
+                st.rerun()
+    st.caption("※ 참고 이미지 및 재생성 지시가 있는 경우에도, 행사 제목·일시·장소는 이미지 모델이 그리지 않고 별도 레이어로 합성합니다.")
 
-    if st.session_state.revision_log:
-        with st.expander('수정 명령 기록'):
-            for number, (design_number, command) in enumerate(st.session_state.revision_log, 1):
-                st.write(f'{number}. 시안 {design_number}: {command}')
+with detail_col:
+    try:
+        selected_png=output_png(draft,meta,photos,size_name)
+        st.image(selected_png,use_container_width=True)
+        col_a,col_b=st.columns(2)
+        with col_a:
+            st.download_button("선택 시안 PNG",data=selected_png,file_name=f"poster_selected_{selected_idx+1}.png",mime="image/png",use_container_width=True)
+        with col_b:
+            if size_name.startswith("A3") or size_name.startswith("A4"):
+                if st.button("300dpi 출력용 준비",use_container_width=True):
+                    st.session_state["print_png"]=high_res_png(selected_png,size_name)
+                if "print_png" in st.session_state:
+                    st.download_button("출력용 PNG 저장",data=st.session_state["print_png"],file_name="poster_print_300dpi.png",mime="image/png",use_container_width=True)
+        st.caption("출력용 PNG는 인쇄 크기로 리샘플링한 파일입니다. 원본 생성 이미지보다 새로운 화질 정보가 늘어나는 것은 아닙니다.")
+    except Exception as exc:
+        st.error("미리보기 오류: "+show_error(exc))
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-        for index, design in enumerate(st.session_state.designs):
-            archive.writestr(f'poster_{index + 1}.png', compose(design['background'], meta))
-    st.download_button('📦 모든 시안 ZIP 저장', buffer.getvalue(), file_name='poster_designs.zip', mime='application/zip')
-    st.caption('AI 이미지 수정은 원본을 완벽하게 유지하지 않을 수 있습니다. 출력 전 인물, 텍스트, 해상도를 확인하세요.')
+st.divider()
+st.subheader("03 · 전체 결과 다운로드")
+if st.button("3개 시안 ZIP 만들기",use_container_width=False):
+    output=io.BytesIO()
+    with zipfile.ZipFile(output,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
+        for idx, item in enumerate(st.session_state.drafts):
+            png=output_png(item,meta,photos,size_name)
+            archive.writestr(f"poster_{idx+1}_{item['spec'].get('layout','design')}.png",png)
+        record={"event":meta,"size":size_name,"models":selected_model,"designs":[{"spec":d["spec"],"source":d.get("source", ""),"edits":d.get("edit_log",[])} for d in st.session_state.drafts]}
+        archive.writestr("project_info.json",json.dumps(record,ensure_ascii=False,indent=2))
+    st.session_state["zip_result"]=output.getvalue()
+if st.session_state.get("zip_result"):
+    st.download_button("포스터 3안 ZIP 다운로드",st.session_state["zip_result"],file_name="poster_studio_3_designs.zip",mime="application/zip")
+
+st.caption("POSTER LAB PRO · 참고 이미지는 AI 스타일 생성에 활용될 수 있습니다. 실제 사용 사진은 코드 합성에만 사용합니다. 학교에서 사용할 때 학생 사진 및 초상권 동의를 확인하세요.")
